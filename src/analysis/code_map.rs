@@ -638,6 +638,9 @@ fn extract_types_from_source(
             // Type extraction for these languages uses different extractors
             Vec::new()
         }
+        Language::Haskell => {
+            Vec::new() // TODO
+        }
         Language::Html | Language::Css | Language::Swift => {
             // These languages don't have type definitions
             Vec::new()

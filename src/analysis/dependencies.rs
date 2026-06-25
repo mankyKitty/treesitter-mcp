@@ -29,6 +29,7 @@ pub fn resolve_dependencies(
             find_js_ts_dependencies(source, file_path, project_root)
         }
         Language::Go => find_go_dependencies(source, file_path, project_root),
+        Language::Haskell => find_haskell_dependencies(source, file_path, project_root),
         _ => vec![],
     }
 }
@@ -500,6 +501,107 @@ fn push_go_package_files(
         }
         if seen.insert(canonical) {
             deps.push(file);
+        }
+    }
+}
+
+/// For Haskell files, find imported modules that live in this project.
+///
+/// Parses `import A.B.C` / `import qualified A.B.C as X` statements and resolves
+/// the dotted module name to `A/B/C.hs`. Resolution is a heuristic (not a full
+/// Cabal/Stack `hs-source-dirs` resolver): the module path is tried against each
+/// ancestor directory of the source file up to the project root, plus the
+/// conventional `src/` and `lib/` roots.
+pub fn find_haskell_dependencies(
+    source: &str,
+    file_path: &Path,
+    project_root: &Path,
+) -> Vec<PathBuf> {
+    let mut deps = Vec::new();
+    let mut seen = HashSet::new();
+    let dir = file_path.parent().unwrap_or(project_root);
+
+    let language = tree_sitter_haskell::LANGUAGE.into();
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return deps;
+    }
+
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return deps,
+    };
+
+    // The `module:` field anchor avoids also matching the `alias:` module of a
+    // `import qualified ... as Alias` statement (both are `module` nodes).
+    let query = match Query::new(&language, r#"(import module: (module) @mod)"#) {
+        Ok(q) => q,
+        Err(_) => return deps,
+    };
+
+    let roots = haskell_source_roots(dir, project_root);
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        for capture in match_.captures {
+            if let Ok(module) = capture.node.utf8_text(source.as_bytes()) {
+                push_haskell_module(&mut deps, &mut seen, module, &roots, project_root);
+            }
+        }
+    }
+
+    deps
+}
+
+/// Candidate source roots a Haskell module hierarchy may be rooted at, ordered
+/// from the most specific (closest to the file) to the most general.
+fn haskell_source_roots(dir: &Path, project_root: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push = |path: PathBuf, seen: &mut HashSet<PathBuf>| {
+        if path.is_dir() && seen.insert(path.clone()) {
+            roots.push(path);
+        }
+    };
+
+    // Walk from the file's directory up to (and including) the project root.
+    let mut current = Some(dir);
+    while let Some(c) = current {
+        push(c.to_path_buf(), &mut seen);
+        if c == project_root {
+            break;
+        }
+        current = c.parent();
+    }
+
+    // Conventional Haskell source roots.
+    push(project_root.join("src"), &mut seen);
+    push(project_root.join("lib"), &mut seen);
+    push(project_root.to_path_buf(), &mut seen);
+
+    roots
+}
+
+fn push_haskell_module(
+    deps: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    module: &str,
+    roots: &[PathBuf],
+    project_root: &Path,
+) {
+    // `A.B.C` -> `A/B/C.hs`
+    let rel: PathBuf = module.split('.').collect();
+    let rel = rel.with_extension("hs");
+
+    for root in roots {
+        let candidate = root.join(&rel);
+        if candidate.is_file() && candidate.starts_with(project_root) && seen.insert(candidate.clone())
+        {
+            deps.push(candidate);
+            return;
         }
     }
 }

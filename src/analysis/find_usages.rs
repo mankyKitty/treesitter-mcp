@@ -547,6 +547,10 @@ fn is_context_node(node_type: &str, language: Language) -> bool {
                 | "interface_declaration"
                 | "enum_declaration"
         ),
+        Language::Haskell => matches!(
+            node_type,
+            "declaration"
+        ),
         Language::Html | Language::Css | Language::Swift => false,
     }
 }

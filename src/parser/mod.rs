@@ -28,6 +28,8 @@ pub enum Language {
     Java,
     /// Go programming language (.go)
     Go,
+    /// Haskell programming language (.hs)
+    Haskell,
 }
 
 impl Language {
@@ -44,6 +46,7 @@ impl Language {
             Language::CSharp => "C#",
             Language::Java => "Java",
             Language::Go => "Go",
+            Language::Haskell => "Haskell",
         }
     }
 
@@ -60,6 +63,7 @@ impl Language {
             Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Language::Java => tree_sitter_java::LANGUAGE.into(),
             Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::Haskell => tree_sitter_haskell::LANGUAGE.into(),
         }
     }
 }
@@ -80,6 +84,7 @@ impl Language {
 /// - `.cs` → C#
 /// - `.java` → Java
 /// - `.go` → Go
+/// - `.hs`  → Haskell
 ///
 /// # Arguments
 /// * `path` - File path (can be absolute, relative, or just a filename)
@@ -126,6 +131,7 @@ pub fn detect_language(path: impl AsRef<Path>) -> Result<Language> {
         Some("cs") => Ok(Language::CSharp),
         Some("java") => Ok(Language::Java),
         Some("go") => Ok(Language::Go),
+        Some("hs") => Ok(Language::Haskell),
         Some(ext) => {
             bail!("Unsupported file extension: .{}", ext)
         }

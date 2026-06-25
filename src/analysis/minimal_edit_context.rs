@@ -380,11 +380,29 @@ fn is_call_node(kind: &str, language: Language) -> bool {
         Language::Python => kind == "call",
         Language::JavaScript | Language::TypeScript | Language::Go => kind == "call_expression",
         Language::Java | Language::CSharp | Language::Swift => kind.ends_with("invocation"),
+        Language::Haskell => kind == "apply",
         Language::Html | Language::Css => false,
     }
 }
 
 fn call_name(node: Node<'_>, source: &str) -> Option<String> {
+    // Haskell function application is curried and left-associative:
+    // `f x y` parses as `apply(apply(f, x), y)`. The callee is the leftmost
+    // leaf of the `function` spine.
+    if node.kind() == "apply" {
+        // Skip the inner applications of a curried spine; only the outermost
+        // `apply` represents the call, so inner ones (the `function` child of a
+        // parent `apply`) must not be counted again.
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "apply"
+                && parent.child_by_field_name("function").map(|f| f.id()) == Some(node.id())
+            {
+                return None;
+            }
+        }
+        return haskell_call_name(node, source);
+    }
+
     for field in ["function", "name", "method", "field"] {
         if let Some(child) = node.child_by_field_name(field) {
             if let Some(name) = last_identifier_text(child, source) {
@@ -419,6 +437,39 @@ fn last_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
         }
     }
 
+    found
+}
+
+/// Resolve the callee name of a Haskell `apply` node by walking the leftmost
+/// `function` spine down to the head, then taking its (possibly qualified) name.
+fn haskell_call_name(apply_node: Node<'_>, source: &str) -> Option<String> {
+    let mut head = apply_node;
+    while head.kind() == "apply" {
+        match head.child_by_field_name("function") {
+            Some(func) => head = func,
+            None => break,
+        }
+    }
+    haskell_callee_name(head, source)
+}
+
+/// Extract the function/constructor name from a Haskell call head, stripping any
+/// module qualifier (e.g. `Map.lookup` -> `lookup`).
+fn haskell_callee_name(node: Node<'_>, source: &str) -> Option<String> {
+    if matches!(node.kind(), "variable" | "constructor") {
+        return node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(ToOwned::to_owned);
+    }
+
+    let mut found = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(name) = haskell_callee_name(child, source) {
+            found = Some(name);
+        }
+    }
     found
 }
 

@@ -183,6 +183,7 @@ pub fn extract_enhanced_shape(
         Language::CSharp => extract_csharp_enhanced(tree, source, include_code)?,
         Language::Java => extract_java_enhanced(tree, source, include_code)?,
         Language::Go => extract_go_enhanced(tree, source, include_code)?,
+        Language::Haskell => extract_haskell_enhanced(tree, source, include_code)?,
         Language::Html | Language::Css => {
             // HTML and CSS are markup/styling languages and are not suitable for
             // structural shape analysis. They lack the function/class/module structure
@@ -212,6 +213,321 @@ pub fn extract_enhanced_shape(
         path: file_path.map(|p| p.to_string()),
         language: Some(language.name().to_string()),
         ..shape
+    })
+}
+
+/// Extract the Haddock doc comment immediately preceding a Haskell declaration.
+///
+/// Haddock attaches documentation with `-- | ...` (and continuation `--`) lines,
+/// which tree-sitter-haskell parses as `haddock` nodes. Block form `{- | ... -}`
+/// is also a `haddock` node. We walk backwards over preceding sibling comment
+/// nodes and return the first non-empty doc string.
+fn extract_haskell_doc(node: Node, source: &str) -> Option<String> {
+    // Walk backwards over preceding sibling comment nodes.
+    let mut lines = collect_haddock_back(node.prev_sibling(), source);
+
+    // Grammar quirk: a Haddock comment that precedes the *first* declaration in
+    // a block is absorbed as the trailing child of the preceding block (e.g. the
+    // last child of `imports`). When the node has no comment siblings of its own,
+    // fall back to the trailing comments of the previous block.
+    if lines.is_empty() && node.prev_sibling().is_none() {
+        if let Some(prev_block) = node.parent().and_then(|p| p.prev_sibling()) {
+            let last = prev_block
+                .named_child(prev_block.named_child_count().saturating_sub(1) as u32);
+            lines = collect_haddock_back(last, source);
+        }
+    }
+
+    let doc = lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if doc.is_empty() {
+        None
+    } else {
+        Some(doc)
+    }
+}
+
+/// Walk backwards from `start` over consecutive comment/haddock siblings,
+/// returning their stripped text in source order. Stops at the first
+/// non-comment sibling.
+fn collect_haddock_back(start: Option<Node>, source: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut prev = start;
+    while let Some(sibling) = prev {
+        match sibling.kind() {
+            "haddock" | "comment" => {
+                if let Ok(text) = sibling.utf8_text(source.as_bytes()) {
+                    lines.insert(0, strip_haskell_comment_markers(text));
+                }
+            }
+            _ => break,
+        }
+        prev = sibling.prev_sibling();
+    }
+    lines
+}
+
+/// Strip Haskell/Haddock comment markers (`--`, `-- |`, `-- ^`, `{- | -}`).
+fn strip_haskell_comment_markers(text: &str) -> String {
+    let t = text.trim();
+    let t = t
+        .strip_prefix("{-")
+        .map(|s| s.strip_suffix("-}").unwrap_or(s))
+        .unwrap_or(t)
+        .trim();
+    let t = t.strip_prefix("--").unwrap_or(t).trim_start();
+    // Drop the Haddock direction markers if present.
+    let t = t.strip_prefix('|').or_else(|| t.strip_prefix('^')).unwrap_or(t);
+    t.trim().to_string()
+}
+
+/// Extract enhanced shape from Haskell source code.
+///
+/// Maps Haskell constructs onto the shared shape model:
+/// - top-level `signature` + `function`/`bind` clauses -> functions (deduplicated
+///   by name, with the type signature used as the displayed signature)
+/// - `data_type` / `newtype` / `type_synomym` -> structs
+/// - `class` -> traits
+/// - `import` -> imports
+fn extract_haskell_enhanced(
+    tree: &Tree,
+    source: &str,
+    include_code: bool,
+) -> Result<EnhancedFileShape, io::Error> {
+    let mut structs = Vec::new();
+    let mut traits = Vec::new();
+    let mut imports = Vec::new();
+
+    // A function's identity is its name. Haskell spreads a definition across an
+    // optional type signature plus one or more equation clauses, so we accumulate
+    // by name and merge spans/signatures afterwards.
+    struct FnAcc {
+        signature: Option<String>,
+        sig_line: Option<usize>,
+        first_def_line: Option<usize>,
+        end_line: usize,
+        doc: Option<String>,
+        code_node: Option<usize>, // byte offset of node to extract code from
+        order: usize,
+    }
+    let mut fns: std::collections::HashMap<String, FnAcc> = std::collections::HashMap::new();
+    let mut order_counter = 0usize;
+
+    let query = Query::new(
+        &tree_sitter_haskell::LANGUAGE.into(),
+        r#"
+        (declarations (signature name: (variable) @sig.name) @sig)
+        (declarations (function name: (variable) @fun.name) @fun)
+        (declarations (bind name: (variable) @bind.name) @bind)
+        (declarations (data_type name: (name) @data.name) @data)
+        (declarations (newtype name: (name) @newtype.name) @newtype)
+        (declarations (type_synomym name: (name) @type.name) @type)
+        (declarations (class name: (name) @class.name) @class)
+        (imports (import) @import)
+        "#,
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to create tree-sitter query: {e}"),
+        )
+    })?;
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        // Each pattern has a name capture and a node capture; resolve both.
+        let mut name_node: Option<Node> = None;
+        let mut decl_node: Option<Node> = None;
+        let mut kind = "";
+        for capture in match_.captures {
+            let capture_name = query.capture_names()[capture.index as usize];
+            if let Some((k, suffix)) = capture_name.split_once('.') {
+                if suffix == "name" {
+                    name_node = Some(capture.node);
+                    kind = k;
+                }
+            } else {
+                decl_node = Some(capture.node);
+                kind = capture_name;
+            }
+        }
+
+        let decl = match decl_node {
+            Some(n) => n,
+            None => continue,
+        };
+        let name = name_node
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(ToOwned::to_owned);
+
+        let line = decl.start_position().row + 1;
+        let end_line = decl.end_position().row + 1;
+
+        match kind {
+            "sig" => {
+                if let Some(name) = name {
+                    let sig_text = decl
+                        .utf8_text(source.as_bytes())
+                        .unwrap_or("")
+                        .split('\n')
+                        .map(str::trim)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let entry = fns.entry(name).or_insert_with(|| {
+                        order_counter += 1;
+                        FnAcc {
+                            signature: None,
+                            sig_line: None,
+                            first_def_line: None,
+                            end_line,
+                            doc: None,
+                            code_node: None,
+                            order: order_counter,
+                        }
+                    });
+                    entry.signature = Some(sig_text);
+                    entry.sig_line = Some(line);
+                    entry.end_line = entry.end_line.max(end_line);
+                    if entry.doc.is_none() {
+                        entry.doc = extract_haskell_doc(decl, source);
+                    }
+                }
+            }
+            "fun" | "bind" => {
+                if let Some(name) = name {
+                    let entry = fns.entry(name).or_insert_with(|| {
+                        order_counter += 1;
+                        FnAcc {
+                            signature: None,
+                            sig_line: None,
+                            first_def_line: None,
+                            end_line,
+                            doc: None,
+                            code_node: None,
+                            order: order_counter,
+                        }
+                    });
+                    if entry.first_def_line.is_none() {
+                        entry.first_def_line = Some(line);
+                        entry.code_node = Some(decl.start_byte());
+                        // Fall back to the equation's left-hand side as a signature
+                        // when there is no explicit type signature.
+                        if entry.signature.is_none() {
+                            let lhs = decl
+                                .child_by_field_name("match")
+                                .map(|m| &source.as_bytes()[decl.start_byte()..m.start_byte()])
+                                .map(|b| String::from_utf8_lossy(b).trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            entry.signature = lhs;
+                        }
+                        if entry.doc.is_none() {
+                            entry.doc = extract_haskell_doc(decl, source);
+                        }
+                    }
+                    entry.end_line = entry.end_line.max(end_line);
+                }
+            }
+            "data" | "newtype" | "type" => {
+                if let Some(name) = name {
+                    let doc = extract_haskell_doc(decl, source);
+                    let code = if include_code {
+                        extract_code(decl, source)?
+                    } else {
+                        None
+                    };
+                    structs.push(EnhancedStructInfo {
+                        name,
+                        line,
+                        end_line,
+                        doc,
+                        code,
+                    });
+                }
+            }
+            "class" => {
+                if let Some(name) = name {
+                    let doc = extract_haskell_doc(decl, source);
+                    traits.push(TraitInfo {
+                        name,
+                        line,
+                        end_line,
+                        doc,
+                        methods: vec![],
+                    });
+                }
+            }
+            "import" => {
+                if let Ok(text) = decl.utf8_text(source.as_bytes()) {
+                    imports.push(ImportInfo {
+                        text: text.trim().to_string(),
+                        line,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Materialize functions in source order.
+    let mut fn_entries: Vec<(String, FnAcc)> = fns.into_iter().collect();
+    fn_entries.sort_by_key(|(_, acc)| acc.order);
+
+    let mut functions = Vec::new();
+    for (name, acc) in fn_entries {
+        let line = acc
+            .sig_line
+            .or(acc.first_def_line)
+            .unwrap_or(acc.end_line);
+        let signature = acc.signature.unwrap_or_else(|| name.clone());
+        let code = if include_code {
+            acc.code_node
+                .and_then(|start| {
+                    // Recover the node at this offset to extract its full text.
+                    let root = tree.root_node();
+                    root.descendant_for_byte_range(start, start)
+                        .and_then(|n| find_parent_by_type(n, "function").ok())
+                        .or_else(|| {
+                            root.descendant_for_byte_range(start, start)
+                                .and_then(|n| find_parent_by_type(n, "bind").ok())
+                        })
+                })
+                .and_then(|n| extract_code(n, source).ok().flatten())
+        } else {
+            None
+        };
+
+        functions.push(EnhancedFunctionInfo {
+            name,
+            signature,
+            line,
+            end_line: acc.end_line,
+            doc: acc.doc,
+            code,
+            annotations: vec![],
+        });
+    }
+
+    functions.sort_by_key(|f| f.line);
+
+    Ok(EnhancedFileShape {
+        path: None,
+        language: None,
+        functions,
+        structs,
+        classes: vec![],
+        traits,
+        interfaces: vec![],
+        properties: vec![],
+        imports,
+        impl_blocks: vec![],
+        dependencies: vec![],
     })
 }
 
