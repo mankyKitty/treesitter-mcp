@@ -220,6 +220,17 @@ fn is_context_node(node_type: &str, language: Language) -> bool {
                 | "interface_declaration"
                 | "enum_declaration"
         ),
+        Language::Haskell => matches!(
+            node_type,
+            "function"
+                | "bind"
+                | "signature"
+                | "data_type"
+                | "newtype"
+                | "type_synomym"
+                | "class"
+                | "instance"
+        ),
         _ => false,
     }
 }
@@ -240,6 +251,14 @@ fn extract_scope_info(node: Node, source: &str) -> Option<ScopeInfo> {
         "property_declaration" => "property",
         "interface_declaration" => "interface",
         "namespace_declaration" => "namespace",
+        // Haskell
+        "function" | "bind" => "function",
+        "signature" => "signature",
+        "data_type" => "data",
+        "newtype" => "newtype",
+        "type_synomym" => "type",
+        "class" => "class",
+        "instance" => "instance",
         _ => "unknown",
     };
 

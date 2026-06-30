@@ -30,8 +30,8 @@ use crate::common::budget;
 use crate::common::budget::BudgetTracker;
 use crate::common::format;
 use crate::extraction::types::{
-    extract_go_types, extract_python_types, extract_rust_types, extract_typescript_types,
-    TypeDefinition,
+    extract_go_types, extract_haskell_types, extract_python_types, extract_rust_types,
+    extract_typescript_types, TypeDefinition,
 };
 use crate::mcp_types::{CallToolResult, CallToolResultExt};
 use crate::parser::{detect_language, parse_code};
@@ -598,7 +598,10 @@ fn structs_to_rows(structs: &[EnhancedStructInfo], detail: DetailLevel) -> Strin
             fields.push(s.name.clone());
             fields.push(s.line.to_string());
 
-            let sig = signature_snippet_from_code(s.code.as_deref());
+            let sig = s
+                .signature
+                .clone()
+                .unwrap_or_else(|| signature_snippet_from_code(s.code.as_deref()));
             fields.push(sig);
 
             if detail == DetailLevel::Full {
@@ -851,7 +854,8 @@ fn extract_referenced_type_names(
         crate::parser::Language::Rust
         | crate::parser::Language::TypeScript
         | crate::parser::Language::Python
-        | crate::parser::Language::Go => {
+        | crate::parser::Language::Go
+        | crate::parser::Language::Haskell => {
             extract_ast_position_type_names(language, source, main_shape, file_path, focus_symbol)
         }
         _ => extract_referenced_type_names_fallback(source, main_shape),
@@ -916,6 +920,7 @@ fn extract_local_type_definitions(
         }
         crate::parser::Language::Python => extract_python_types(source, file_path).ok(),
         crate::parser::Language::Go => extract_go_types(source, file_path).ok(),
+        crate::parser::Language::Haskell => extract_haskell_types(source, file_path).ok(),
         _ => None,
     }
 }

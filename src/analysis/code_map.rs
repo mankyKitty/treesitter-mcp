@@ -638,9 +638,8 @@ fn extract_types_from_source(
             // Type extraction for these languages uses different extractors
             Vec::new()
         }
-        Language::Haskell => {
-            Vec::new() // TODO
-        }
+        Language::Haskell => crate::extraction::types::extract_haskell_types(source, path)
+            .map_err(|e| io::Error::other(e.to_string()))?,
         Language::Html | Language::Css | Language::Swift => {
             // These languages don't have type definitions
             Vec::new()

@@ -23,12 +23,14 @@
 
 ## treesitter-mcp Tools
 Use treesitter-mcp to understand code structure before making changes:
-- **Exploring codebase?** → `code_map` on the directory
-- **Before editing a file?** → `parse_file` to understand it fully
-- **Refactoring or renaming?** → `find_usages` to check impact
+- **Exploring codebase?** → `code_map` on the directory (add `with_types=true` for types in one pass)
+- **Before editing a file?** → `view_code` (`detail="signatures"`, or `focus_symbol` for one symbol)
+- **Editing one known symbol?** → `minimal_edit_context`
+- **Refactoring or renaming?** → `find_usages` / `call_graph` to check impact
 - **After making changes?** → `parse_diff` to verify what changed at symbol level
 - **Before running tests?** → `affected_by_diff` to see what might break
-- **Got a line number?** → `get_context` to understand scope
-- **Need quick file overview?** → `file_shape` for skeleton only
+- **Got a line number?** → `symbol_at_line` to understand scope
+- **Need the project's types?** → `type_map`
 
 Prefer treesitter-mcp over grep for structural queries (finding functions, classes, usages).
+Supported languages: Rust, Python, JavaScript, TypeScript, HTML, CSS, Swift, C#, Java, Go, Haskell.

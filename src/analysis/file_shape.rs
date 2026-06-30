@@ -57,7 +57,7 @@ pub struct FileShape {
 
 #[deprecated(
     since = "0.2.0",
-    note = "Use shape::extract_enhanced_shape instead. extract_shape only supports Rust/Swift/Python, while extract_enhanced_shape supports all 9 languages."
+    note = "Use shape::extract_enhanced_shape instead. extract_shape only supports Rust/Swift/Python, while extract_enhanced_shape supports all 11 languages."
 )]
 pub fn extract_shape(
     tree: &Tree,
