@@ -117,4 +117,82 @@ Point = NamedTuple("Point", [("x", int), ("y", int)])
 
         Ok(())
     }
+
+    #[test]
+    fn test_haskell_extraction() -> Result<()> {
+        let source = r#"module M where
+
+-- | A geometric shape.
+data Shape
+  = Circle Double
+  | Rect { width :: Double, height :: Double }
+  deriving (Show, Eq)
+
+newtype Wrapper a = Wrapper { unwrap :: a }
+
+data Point = Point { px :: Int, py :: Int }
+
+type Name = String
+
+class Named a where
+  name :: a -> Name
+  rename :: Name -> a -> a
+"#;
+
+        let result = extract_haskell_types(source, Path::new("M.hs"))?;
+
+        // Multi-constructor `data` -> enum whose variants are the constructors.
+        let shape = result.iter().find(|t| t.name == "Shape").unwrap();
+        assert_eq!(shape.kind, TypeKind::Enum);
+        let variants: Vec<&str> = shape
+            .variants
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert!(variants.contains(&"Circle"), "variants: {variants:?}");
+        assert!(variants.contains(&"Rect"), "variants: {variants:?}");
+
+        // Single record constructor `data` -> struct with named fields.
+        let point = result.iter().find(|t| t.name == "Point").unwrap();
+        assert_eq!(point.kind, TypeKind::Struct);
+        let pfields: Vec<&str> = point
+            .fields
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(pfields, vec!["px", "py"], "fields: {pfields:?}");
+
+        // newtype -> struct; its record field is surfaced.
+        let wrapper = result.iter().find(|t| t.name == "Wrapper").unwrap();
+        assert_eq!(wrapper.kind, TypeKind::Struct);
+        assert!(wrapper
+            .fields
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|f| f.name == "unwrap"));
+
+        // type synonym -> alias.
+        let name = result.iter().find(|t| t.name == "Name").unwrap();
+        assert_eq!(name.kind, TypeKind::TypeAlias);
+
+        // class -> trait; methods become members.
+        let named = result.iter().find(|t| t.name == "Named").unwrap();
+        assert_eq!(named.kind, TypeKind::Trait);
+        let members: Vec<&str> = named
+            .members
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert!(members.contains(&"name"), "members: {members:?}");
+        assert!(members.contains(&"rename"), "members: {members:?}");
+
+        Ok(())
+    }
 }

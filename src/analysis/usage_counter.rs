@@ -150,6 +150,7 @@ pub enum CountLanguage {
     JavaScript,
     Rust,
     Python,
+    Haskell,
     Plain,
 }
 
@@ -162,6 +163,7 @@ pub fn language_for_path(path: &Path) -> CountLanguage {
         "rs" => CountLanguage::Rust,
         "py" => CountLanguage::Python,
         "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" => CountLanguage::JavaScript,
+        "hs" => CountLanguage::Haskell,
         "go" | "java" | "cs" | "c" | "h" | "cpp" | "hpp" | "cc" => CountLanguage::CLike,
         _ => CountLanguage::Plain,
     }
@@ -196,6 +198,7 @@ pub fn strip_comments_and_strings(content: &str, language: CountLanguage) -> Str
                 allow_triple_quote: true,
                 allow_backtick: false,
                 allow_rust_raw_strings: false,
+                haskell_comments: false,
             },
         ),
         CountLanguage::JavaScript => strip_with_config(
@@ -208,6 +211,7 @@ pub fn strip_comments_and_strings(content: &str, language: CountLanguage) -> Str
                 allow_triple_quote: false,
                 allow_backtick: true,
                 allow_rust_raw_strings: false,
+                haskell_comments: false,
             },
         ),
         CountLanguage::Rust => strip_with_config(
@@ -220,6 +224,24 @@ pub fn strip_comments_and_strings(content: &str, language: CountLanguage) -> Str
                 allow_triple_quote: false,
                 allow_backtick: false,
                 allow_rust_raw_strings: true,
+                haskell_comments: false,
+            },
+        ),
+        CountLanguage::Haskell => strip_with_config(
+            content,
+            StripConfig {
+                // `--` line comments and nestable `{- -}` blocks are handled by
+                // `haskell_comments`. Single quotes are NOT string delimiters here:
+                // `x'` is a valid identifier, so treating `'` as a char-literal
+                // start would corrupt word counts.
+                line_comment: None,
+                c_like_comments: false,
+                allow_single_quote: false,
+                allow_double_quote: true,
+                allow_triple_quote: false,
+                allow_backtick: false,
+                allow_rust_raw_strings: false,
+                haskell_comments: true,
             },
         ),
         CountLanguage::CLike => strip_with_config(
@@ -232,6 +254,7 @@ pub fn strip_comments_and_strings(content: &str, language: CountLanguage) -> Str
                 allow_triple_quote: false,
                 allow_backtick: false,
                 allow_rust_raw_strings: false,
+                haskell_comments: false,
             },
         ),
     }
@@ -246,6 +269,8 @@ struct StripConfig {
     allow_triple_quote: bool,
     allow_backtick: bool,
     allow_rust_raw_strings: bool,
+    /// Haskell `--` line comments and nestable `{- -}` block comments.
+    haskell_comments: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -253,6 +278,7 @@ enum Mode {
     Code,
     LineComment,
     BlockComment,
+    HaskellBlock { depth: usize },
     String { quote: char, triple: bool },
     Backtick,
     RustRaw { hashes: usize },
@@ -304,6 +330,25 @@ fn strip_with_config(content: &str, config: StripConfig) -> String {
                     i += 1;
                     mode = Mode::LineComment;
                     continue;
+                }
+
+                if config.haskell_comments {
+                    // `{-` opens a (nestable) block comment. Covers `{-# ... #-}` pragmas.
+                    if b == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                        out.push(' ');
+                        out.push(' ');
+                        i += 2;
+                        mode = Mode::HaskellBlock { depth: 1 };
+                        continue;
+                    }
+                    // `--` opens a line comment.
+                    if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                        out.push(' ');
+                        out.push(' ');
+                        i += 2;
+                        mode = Mode::LineComment;
+                        continue;
+                    }
                 }
 
                 if config.allow_backtick && b == b'`' {
@@ -376,6 +421,37 @@ fn strip_with_config(content: &str, config: StripConfig) -> String {
                     out.push(' ');
                     i += 2;
                     mode = Mode::Code;
+                    continue;
+                }
+
+                out.push(' ');
+                i += 1;
+            }
+            Mode::HaskellBlock { depth } => {
+                if b == b'\n' {
+                    out.push('\n');
+                    i += 1;
+                    continue;
+                }
+
+                // Nesting: `{-` deepens, `-}` closes one level.
+                if b == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    mode = Mode::HaskellBlock { depth: depth + 1 };
+                    continue;
+                }
+
+                if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    mode = if depth <= 1 {
+                        Mode::Code
+                    } else {
+                        Mode::HaskellBlock { depth: depth - 1 }
+                    };
                     continue;
                 }
 

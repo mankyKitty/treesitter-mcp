@@ -144,8 +144,11 @@ fn haskell_dependencies_resolve_module_imports() {
     fs::create_dir_all(src.join("My")).unwrap();
 
     let util = src.join("My").join("Util.hs");
-    fs::write(&util, "module My.Util (helper) where\n\nhelper :: Int -> Int\nhelper = (+1)\n")
-        .unwrap();
+    fs::write(
+        &util,
+        "module My.Util (helper) where\n\nhelper :: Int -> Int\nhelper = (+1)\n",
+    )
+    .unwrap();
     fs::write(
         src.join("My").join("Data.hs"),
         "module My.Data where\n\nx :: Int\nx = 1\n",
@@ -165,7 +168,81 @@ fn haskell_dependencies_resolve_module_imports() {
 
     // Both project-local modules resolve (qualified import included); the
     // external `Data.List` and the alias `D` do not produce spurious entries.
-    assert!(deps.iter().any(|p| p.ends_with("My/Util.hs")), "deps: {deps:?}");
-    assert!(deps.iter().any(|p| p.ends_with("My/Data.hs")), "deps: {deps:?}");
-    assert_eq!(deps.len(), 2, "expected exactly two local deps, got {deps:?}");
+    assert!(
+        deps.iter().any(|p| p.ends_with("My/Util.hs")),
+        "deps: {deps:?}"
+    );
+    assert!(
+        deps.iter().any(|p| p.ends_with("My/Data.hs")),
+        "deps: {deps:?}"
+    );
+    assert_eq!(
+        deps.len(),
+        2,
+        "expected exactly two local deps, got {deps:?}"
+    );
+}
+
+#[test]
+fn haskell_type_map_reports_kinds() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("M.hs"), SRC).unwrap();
+
+    let result = treesitter_mcp::analysis::type_map::execute(&json!({
+        "path": dir.path().to_str().unwrap(),
+        "max_tokens": 3000,
+    }))
+    .unwrap();
+    let output: serde_json::Value =
+        serde_json::from_str(&common::get_result_text(&result)).unwrap();
+
+    // Columns: name|kind|file|line|usage_count
+    let rows = common::helpers::parse_compact_rows(output["types"].as_str().unwrap());
+    let kind_of = |name: &str| -> Option<String> {
+        rows.iter()
+            .find(|r| r.first().map(String::as_str) == Some(name))
+            .and_then(|r| r.get(1).cloned())
+    };
+
+    assert_eq!(kind_of("Shape").as_deref(), Some("enum"));
+    assert_eq!(kind_of("Wrapper").as_deref(), Some("struct"));
+    assert_eq!(kind_of("Name").as_deref(), Some("type_alias"));
+    assert_eq!(kind_of("Greet").as_deref(), Some("trait"));
+}
+
+#[test]
+fn haskell_symbol_at_line_names_owning_function() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("M.hs");
+    fs::write(&file_path, SRC).unwrap();
+
+    // Line 22 of SRC is the first `area` equation (`area (Circle r) = ...`).
+    let result = treesitter_mcp::analysis::symbol_at_line::execute(&json!({
+        "file_path": file_path.to_str().unwrap(),
+        "line": 22,
+    }))
+    .unwrap();
+    let output: serde_json::Value =
+        serde_json::from_str(&common::get_result_text(&result)).unwrap();
+
+    assert_eq!(output["sym"].as_str(), Some("area"));
+}
+
+#[test]
+fn haskell_usage_counter_ignores_comment_identifiers() {
+    use std::collections::HashMap;
+    use treesitter_mcp::analysis::usage_counter::{count_words_in_content, CountLanguage};
+
+    // `ghost` appears only inside `--` and nested `{- {- -} -}` comments, never in code.
+    let src = "-- ghost\n{- ghost {- ghost -} ghost -}\nreal :: Int\nreal = realValue\n";
+    let mut counts = HashMap::new();
+    count_words_in_content(src, CountLanguage::Haskell, &mut counts);
+
+    assert_eq!(
+        counts.get("ghost"),
+        None,
+        "comment identifiers must not be counted"
+    );
+    assert_eq!(counts.get("real").copied(), Some(2));
+    assert_eq!(counts.get("realValue").copied(), Some(1));
 }

@@ -236,6 +236,7 @@ fn process_file_with_source(
         SupportedLanguage::Java => extract_java_types(source, relative_path)?,
         SupportedLanguage::CSharp => extract_csharp_types(source, relative_path)?,
         SupportedLanguage::Go => extract_go_types(source, relative_path)?,
+        SupportedLanguage::Haskell => extract_haskell_types(source, relative_path)?,
     };
 
     for ty in file_types {
@@ -295,6 +296,7 @@ enum SupportedLanguage {
     Java,
     CSharp,
     Go,
+    Haskell,
 }
 
 fn detect_language(path: &Path) -> Option<SupportedLanguage> {
@@ -307,6 +309,7 @@ fn detect_language(path: &Path) -> Option<SupportedLanguage> {
         "java" => Some(SupportedLanguage::Java),
         "cs" => Some(SupportedLanguage::CSharp),
         "go" => Some(SupportedLanguage::Go),
+        "hs" => Some(SupportedLanguage::Haskell),
         _ => None,
     }
 }
@@ -1510,6 +1513,340 @@ pub(crate) fn extract_go_types(source: &str, relative_path: &Path) -> Result<Vec
     }
 
     Ok(definitions)
+}
+
+pub(crate) fn extract_haskell_types(
+    source: &str,
+    relative_path: &Path,
+) -> Result<Vec<TypeDefinition>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_haskell::LANGUAGE.into())
+        .wrap_err("Failed to configure Haskell parser")?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| eyre::eyre!("Failed to parse Haskell source"))?;
+
+    // Top-level type-defining declarations. These `name: (name)` selectors mirror
+    // the ones proven in `analysis::shape::extract_haskell_enhanced`.
+    let query_src = r#"
+        (declarations (data_type name: (name) @name) @data)
+        (declarations (newtype name: (name) @name) @newtype)
+        (declarations (type_synomym name: (name) @name) @alias)
+        (declarations (class name: (name) @name) @class)
+    "#;
+
+    let query = Query::new(&tree_sitter_haskell::LANGUAGE.into(), query_src)
+        .wrap_err("Failed to compile Haskell query")?;
+
+    let source_bytes = source.as_bytes();
+    let file_path = relative_path.to_path_buf();
+    let mut definitions = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source_bytes);
+
+    while let Some(match_) = matches.next() {
+        let mut name_node = None;
+        let mut def_node = None;
+        let mut kind = TypeKind::TypeAlias;
+
+        for capture in match_.captures {
+            let capture_name = query.capture_names()[capture.index as usize];
+            match capture_name {
+                "name" => name_node = Some(capture.node),
+                "data" => {
+                    def_node = Some(capture.node);
+                    kind = TypeKind::Enum;
+                }
+                "newtype" => {
+                    def_node = Some(capture.node);
+                    kind = TypeKind::Struct;
+                }
+                "alias" => {
+                    def_node = Some(capture.node);
+                    kind = TypeKind::TypeAlias;
+                }
+                "class" => {
+                    def_node = Some(capture.node);
+                    kind = TypeKind::Trait;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(name_node) = name_node else {
+            continue;
+        };
+        let Some(def_node) = def_node else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(source_bytes) else {
+            continue;
+        };
+
+        let mut final_kind = kind;
+        let mut fields = None;
+        let mut variants = None;
+        let mut members = None;
+
+        match kind {
+            TypeKind::Enum => {
+                // `data`. A single record constructor reads more usefully as a
+                // struct (named fields); anything else is a sum type whose
+                // constructors are its variants.
+                let ctors = haskell_constructors(def_node, source_bytes);
+                if ctors.len() == 1 && ctors[0].1.is_some() {
+                    final_kind = TypeKind::Struct;
+                    fields = ctors.into_iter().next().and_then(|(_, f)| f);
+                } else if !ctors.is_empty() {
+                    variants = Some(
+                        ctors
+                            .into_iter()
+                            .map(|(name, _)| Variant {
+                                name,
+                                type_annotation: None,
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            TypeKind::Struct => {
+                // `newtype` has exactly one constructor; surface record fields.
+                if let Some((_, Some(record_fields))) = haskell_constructors(def_node, source_bytes)
+                    .into_iter()
+                    .next()
+                {
+                    fields = Some(record_fields);
+                }
+            }
+            TypeKind::Trait => {
+                // type class -> methods become members.
+                members = haskell_class_methods(def_node, source_bytes);
+            }
+            _ => {}
+        }
+
+        definitions.push(TypeDefinition {
+            name: name.to_string(),
+            kind: final_kind,
+            file: file_path.clone(),
+            line: def_node.start_position().row + 1,
+            signature: signature_for(def_node, source_bytes),
+            usage_count: 0,
+            fields,
+            variants,
+            members,
+        });
+    }
+
+    Ok(definitions)
+}
+
+/// Collect the constructors of a Haskell `data_type`/`newtype` node, returning
+/// `(constructor_name, optional_record_fields)` per constructor.
+///
+/// The grammar uses two distinct constructor nodes: `data` wraps each in a
+/// `data_constructor` (whose `constructor` field is a `prefix`/`record`/…), while
+/// `newtype` uses a single `newtype_constructor` (with `name` + a `field` that may
+/// be a `record`). Both are handled here.
+fn haskell_constructors(node: Node, source: &[u8]) -> Vec<(String, Option<Vec<Field>>)> {
+    let mut ctor_nodes = Vec::new();
+    collect_constructor_nodes(node, &mut ctor_nodes);
+
+    let mut out = Vec::new();
+    for ctor in ctor_nodes {
+        match ctor.kind() {
+            "data_constructor" => {
+                // `constructor` field -> prefix | record | infix | special.
+                if let Some(inner) = ctor.child_by_field_name("constructor") {
+                    if let Some(pair) = haskell_constructor_shape(inner, source) {
+                        out.push(pair);
+                    }
+                }
+            }
+            "newtype_constructor" => {
+                let name = ctor
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or_default()
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let fields = ctor
+                    .child_by_field_name("field")
+                    .filter(|f| f.kind() == "record")
+                    .and_then(|r| haskell_record_fields(r, source));
+                out.push((name, fields));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Resolve the `(name, fields)` of a `data_constructor`'s inner shape node.
+fn haskell_constructor_shape(inner: Node, source: &[u8]) -> Option<(String, Option<Vec<Field>>)> {
+    match inner.kind() {
+        "prefix" => {
+            let name = inner
+                .child_by_field_name("name")?
+                .utf8_text(source)
+                .ok()?
+                .to_string();
+            Some((name, None))
+        }
+        "record" => {
+            let name = inner
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name, haskell_record_fields(inner, source)))
+        }
+        _ => {
+            // infix / special constructors: best-effort leading token.
+            let token = inner
+                .utf8_text(source)
+                .ok()?
+                .split_whitespace()
+                .next()?
+                .to_string();
+            if token.is_empty() {
+                None
+            } else {
+                Some((token, None))
+            }
+        }
+    }
+}
+
+/// Depth-first collect of constructor nodes, stopping at each one (their own
+/// subtrees never contain further constructors). A type declaration never nests
+/// another, so this stays bounded.
+fn collect_constructor_nodes<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    let mut walker = node.walk();
+    for child in node.children(&mut walker) {
+        if matches!(child.kind(), "data_constructor" | "newtype_constructor") {
+            out.push(child);
+        } else {
+            collect_constructor_nodes(child, out);
+        }
+    }
+}
+
+/// Extract named record fields from a Haskell `record` node. `data` records nest
+/// their `field` children under a `fields` node; `newtype` records hang them
+/// directly off the `record` — collect from both.
+fn haskell_record_fields(record_node: Node, source: &[u8]) -> Option<Vec<Field>> {
+    let mut field_nodes: Vec<Node> = Vec::new();
+    if let Some(fields_node) = record_node.child_by_field_name("fields") {
+        let mut walker = fields_node.walk();
+        for c in fields_node.children(&mut walker) {
+            if c.kind() == "field" {
+                field_nodes.push(c);
+            }
+        }
+    }
+    let mut walker = record_node.walk();
+    for c in record_node.children(&mut walker) {
+        if c.kind() == "field" {
+            field_nodes.push(c);
+        }
+    }
+
+    let mut fields = Vec::new();
+    for f in field_nodes {
+        let type_annotation = f
+            .child_by_field_name("type")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // A single `field` may bind several names: `width, height :: Double`.
+        let mut nwalker = f.walk();
+        let names: Vec<String> = f
+            .children(&mut nwalker)
+            .filter(|n| n.kind() == "field_name")
+            .filter_map(|n| n.utf8_text(source).ok().map(|s| s.trim().to_string()))
+            .collect();
+
+        if names.is_empty() {
+            if let Some(name) = f
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
+                fields.push(Field {
+                    name: name.trim().to_string(),
+                    type_annotation: type_annotation.clone(),
+                });
+            }
+        } else {
+            for name in names {
+                fields.push(Field {
+                    name,
+                    type_annotation: type_annotation.clone(),
+                });
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    }
+}
+
+/// Extract a type class's method signatures as members.
+fn haskell_class_methods(class_node: Node, source: &[u8]) -> Option<Vec<Member>> {
+    let decls = class_node.child_by_field_name("declarations")?;
+    let mut members = Vec::new();
+    let mut walker = decls.walk();
+    for d in decls.children(&mut walker) {
+        if d.kind() != "signature" {
+            continue;
+        }
+        let sig_text = d
+            .utf8_text(source)
+            .unwrap_or("")
+            .split('\n')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // `greet, rename :: ...` binds several variables in one signature.
+        let mut nwalker = d.walk();
+        let mut names: Vec<String> = d
+            .children(&mut nwalker)
+            .filter(|n| n.kind() == "variable")
+            .filter_map(|n| n.utf8_text(source).ok().map(str::to_string))
+            .collect();
+        if names.is_empty() {
+            if let Some(name) = d
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
+                names.push(name.to_string());
+            }
+        }
+
+        for name in names {
+            members.push(Member {
+                name,
+                type_annotation: sig_text.clone(),
+            });
+        }
+    }
+
+    if members.is_empty() {
+        None
+    } else {
+        Some(members)
+    }
 }
 
 fn extract_csharp_types(source: &str, relative_path: &Path) -> Result<Vec<TypeDefinition>> {
