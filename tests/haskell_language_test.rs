@@ -75,6 +75,52 @@ fn haskell_enhanced_shape_extracts_symbols() {
     assert_eq!(foo.signature, "foo :: Int -> Int");
 }
 
+#[test]
+fn haskell_shape_surfaces_signatures_methods_and_instances() {
+    let tree = parse_code(SRC, Language::Haskell).expect("parse haskell");
+    let shape = extract_enhanced_shape(&tree, SRC, Language::Haskell, Some("My/Module.hs"), false)
+        .expect("extract haskell shape");
+
+    // data declarations carry a collapsed single-line signature with constructors.
+    let shape_ty = shape.structs.iter().find(|s| s.name == "Shape").unwrap();
+    assert_eq!(
+        shape_ty.signature.as_deref(),
+        Some("data Shape = Circle Double | Rect Double Double"),
+        "deriving clause should be dropped and constructors kept"
+    );
+
+    // class methods are surfaced on the trait.
+    let greet_class = shape.traits.iter().find(|t| t.name == "Greet").unwrap();
+    let method = greet_class
+        .methods
+        .iter()
+        .find(|m| m.name == "greet")
+        .expect("class method greet present");
+    assert_eq!(method.signature, "greet :: a -> String");
+
+    // `instance Greet Shape` is surfaced as an impl block with its method.
+    let inst = shape
+        .impl_blocks
+        .iter()
+        .find(|b| b.trait_name.as_deref() == Some("Greet"))
+        .expect("instance surfaced as impl block");
+    assert!(
+        inst.type_name.contains("Shape"),
+        "type_name: {}",
+        inst.type_name
+    );
+    assert!(
+        inst.methods.iter().any(|m| m.name == "greet"),
+        "instance method greet present"
+    );
+
+    // The instance method must not leak into the top-level function list.
+    assert!(
+        !shape.functions.iter().any(|f| f.name == "greet"),
+        "instance method leaked into top-level functions"
+    );
+}
+
 const CALL_GRAPH_SRC: &str = r#"module Lib (helper, runAll, process) where
 
 import Data.List (sort)

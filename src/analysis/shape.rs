@@ -29,6 +29,12 @@ pub struct EnhancedStructInfo {
     pub name: String,
     pub line: usize,
     pub end_line: usize,
+    /// A single-line type signature, when the body is meaningful on its own
+    /// (e.g. a Haskell `data`/`newtype` declaration's constructors). Languages
+    /// whose struct body is better shown as code leave this `None` and fall back
+    /// to a code snippet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,8 +238,8 @@ fn extract_haskell_doc(node: Node, source: &str) -> Option<String> {
     // fall back to the trailing comments of the previous block.
     if lines.is_empty() && node.prev_sibling().is_none() {
         if let Some(prev_block) = node.parent().and_then(|p| p.prev_sibling()) {
-            let last = prev_block
-                .named_child(prev_block.named_child_count().saturating_sub(1) as u32);
+            let last =
+                prev_block.named_child(prev_block.named_child_count().saturating_sub(1) as u32);
             lines = collect_haddock_back(last, source);
         }
     }
@@ -282,7 +288,10 @@ fn strip_haskell_comment_markers(text: &str) -> String {
         .trim();
     let t = t.strip_prefix("--").unwrap_or(t).trim_start();
     // Drop the Haddock direction markers if present.
-    let t = t.strip_prefix('|').or_else(|| t.strip_prefix('^')).unwrap_or(t);
+    let t = t
+        .strip_prefix('|')
+        .or_else(|| t.strip_prefix('^'))
+        .unwrap_or(t);
     t.trim().to_string()
 }
 
@@ -302,6 +311,7 @@ fn extract_haskell_enhanced(
     let mut structs = Vec::new();
     let mut traits = Vec::new();
     let mut imports = Vec::new();
+    let mut impl_blocks = Vec::new();
 
     // A function's identity is its name. Haskell spreads a definition across an
     // optional type signature plus one or more equation clauses, so we accumulate
@@ -328,6 +338,7 @@ fn extract_haskell_enhanced(
         (declarations (newtype name: (name) @newtype.name) @newtype)
         (declarations (type_synomym name: (name) @type.name) @type)
         (declarations (class name: (name) @class.name) @class)
+        (declarations (instance) @instance)
         (imports (import) @import)
         "#,
     )
@@ -446,6 +457,7 @@ fn extract_haskell_enhanced(
                         name,
                         line,
                         end_line,
+                        signature: Some(haskell_decl_signature(decl, source)),
                         doc,
                         code,
                     });
@@ -454,14 +466,42 @@ fn extract_haskell_enhanced(
             "class" => {
                 if let Some(name) = name {
                     let doc = extract_haskell_doc(decl, source);
+                    let methods = decl
+                        .child_by_field_name("declarations")
+                        .map(|d| haskell_declaration_methods(d, source, include_code))
+                        .unwrap_or_default();
                     traits.push(TraitInfo {
                         name,
                         line,
                         end_line,
                         doc,
-                        methods: vec![],
+                        methods,
                     });
                 }
+            }
+            "instance" => {
+                // `instance <Class> <Type> where ...` maps onto an impl block:
+                // trait_name = the class, type_name = the instantiated type(s).
+                let trait_name = decl
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(str::to_string);
+                let type_name = decl
+                    .child_by_field_name("patterns")
+                    .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                let methods = decl
+                    .child_by_field_name("declarations")
+                    .map(|d| haskell_declaration_methods(d, source, include_code))
+                    .unwrap_or_default();
+                impl_blocks.push(ImplBlockInfo {
+                    type_name,
+                    trait_name,
+                    line,
+                    end_line,
+                    methods,
+                });
             }
             "import" => {
                 if let Ok(text) = decl.utf8_text(source.as_bytes()) {
@@ -481,10 +521,7 @@ fn extract_haskell_enhanced(
 
     let mut functions = Vec::new();
     for (name, acc) in fn_entries {
-        let line = acc
-            .sig_line
-            .or(acc.first_def_line)
-            .unwrap_or(acc.end_line);
+        let line = acc.sig_line.or(acc.first_def_line).unwrap_or(acc.end_line);
         let signature = acc.signature.unwrap_or_else(|| name.clone());
         let code = if include_code {
             acc.code_node
@@ -526,9 +563,85 @@ fn extract_haskell_enhanced(
         interfaces: vec![],
         properties: vec![],
         imports,
-        impl_blocks: vec![],
+        impl_blocks,
         dependencies: vec![],
     })
+}
+
+/// Collapse a Haskell type declaration to a single-line signature, stopping at a
+/// `deriving` clause (noise for a signature). Whitespace and newlines collapse to
+/// single spaces, so `data Shape\n = Circle Double\n | Rect {..}` becomes
+/// `data Shape = Circle Double | Rect {..}`.
+fn haskell_decl_signature(node: Node, source: &str) -> String {
+    let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+    let mut out: Vec<&str> = Vec::new();
+    for tok in text.split_whitespace() {
+        if tok == "deriving" {
+            break;
+        }
+        out.push(tok);
+    }
+    out.join(" ")
+}
+
+/// Extract methods from a Haskell `declarations` node — the body of a `class`
+/// (method type `signature`s) or an `instance` (`function`/`bind` equations).
+fn haskell_declaration_methods(decls: Node, source: &str, include_code: bool) -> Vec<MethodInfo> {
+    let bytes = source.as_bytes();
+    let mut methods = Vec::new();
+    let mut walker = decls.walk();
+    for d in decls.children(&mut walker) {
+        let (name, signature) = match d.kind() {
+            // Class method type signatures: `greet :: a -> String`.
+            "signature" => {
+                let name = d
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+                    .map(str::to_string);
+                (
+                    name,
+                    d.utf8_text(bytes)
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+            // Instance method equations: `greet _ = "shape"`. Use the LHS (up to
+            // `=`) as the displayed signature.
+            "function" | "bind" => {
+                let name = d
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+                    .map(str::to_string);
+                let sig = d
+                    .child_by_field_name("match")
+                    .map(|m| String::from_utf8_lossy(&bytes[d.start_byte()..m.start_byte()]))
+                    .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| name.clone().unwrap_or_default());
+                (name, sig)
+            }
+            _ => continue,
+        };
+
+        let Some(name) = name else {
+            continue;
+        };
+        methods.push(MethodInfo {
+            name,
+            signature,
+            line: d.start_position().row + 1,
+            end_line: d.end_position().row + 1,
+            doc: extract_haskell_doc(d, source),
+            code: if include_code {
+                extract_code(d, source).ok().flatten()
+            } else {
+                None
+            },
+        });
+    }
+    methods
 }
 
 /// Extract enhanced shape from Rust source code
@@ -611,6 +724,7 @@ fn extract_rust_enhanced(
                                 name: name.to_string(),
                                 line,
                                 end_line,
+                                signature: None,
                                 doc,
                                 code,
                             });
@@ -1122,6 +1236,7 @@ fn extract_swift_enhanced(
                                     name: name.to_string(),
                                     line,
                                     end_line,
+                                    signature: None,
                                     doc,
                                     code,
                                 });
@@ -1789,6 +1904,7 @@ fn extract_go_enhanced(
                                 name: name.to_string(),
                                 line,
                                 end_line,
+                                signature: None,
                                 doc,
                                 code,
                             });

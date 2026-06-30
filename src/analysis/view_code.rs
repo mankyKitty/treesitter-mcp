@@ -598,7 +598,10 @@ fn structs_to_rows(structs: &[EnhancedStructInfo], detail: DetailLevel) -> Strin
             fields.push(s.name.clone());
             fields.push(s.line.to_string());
 
-            let sig = signature_snippet_from_code(s.code.as_deref());
+            let sig = s
+                .signature
+                .clone()
+                .unwrap_or_else(|| signature_snippet_from_code(s.code.as_deref()));
             fields.push(sig);
 
             if detail == DetailLevel::Full {
