@@ -90,6 +90,47 @@ Once connected, ask Claude Code to use it explicitly, for example:
 Use treesitter-mcp to map the src directory, then inspect the service layer before proposing changes.
 ```
 
+#### Make it the primary code explorer
+
+Registering the server only makes the tools *available* — Claude Code still
+defaults to `Read`, `Grep`, and `Glob`. To make `treesitter-mcp` the **primary**
+way the agent inspects code, add a standing instruction to the project's memory
+file (`CLAUDE.md` or `AGENTS.md`), which Claude Code loads every session. Paste
+this block (trim the language list to what your repo actually contains):
+
+```markdown
+## Code exploration — prefer treesitter-mcp
+
+For understanding and navigating code, reach for the `treesitter-mcp` tools
+before `Read`/`Grep`/`Glob`. They return compact, AST-derived answers
+(signatures, usage rows, call graphs, focused edit context) instead of raw
+file bodies, which is faster and uses far fewer tokens.
+
+- Don't know where code lives yet → `code_map` (add `with_types=true` for types in one pass)
+- Understand a known file → `view_code` (`detail="signatures"`; `focus_symbol="name"` for one symbol)
+- About to edit one symbol → `minimal_edit_context`
+- "Where is X used / what calls X?" → `find_usages` / `call_graph` (not `grep`)
+- Need the project's types → `type_map`
+- A symbol at a line (e.g. from a stack trace) → `symbol_at_line`
+- Reviewing your own diff → `review_context`, then `parse_diff` / `affected_by_diff`
+
+Start with `detail="signatures"` before `detail="full"`, use `focus_symbol`
+when editing one function, and set `find_usages` `max_context_lines` on common
+symbols to avoid token blow-ups.
+
+Fall back to `Read`/`Grep` only for: file types treesitter-mcp can't parse
+(anything outside Rust, Python, JavaScript, TypeScript, HTML, CSS, Swift, C#,
+Java, Go, Haskell — e.g. config, SQL, Markdown, templating, custom DSLs);
+exact-string or regex search where you need the literal match; and very small
+files where reading the whole thing is already cheap.
+```
+
+Treat the structural tools as best-effort, not compiler-grade: `find_usages`,
+`call_graph`, and `affected_by_diff` are syntax-aware and may match same-named
+symbols in other scopes. For precise rename/refactor verification, pair with an
+LSP (`format_references` / `format_diagnostics` consume LSP output) or confirm
+the change before applying it.
+
 ### Codex
 
 Add the server to `~/.codex/config.toml`:
@@ -175,11 +216,16 @@ Notes:
 
 ## Use This Instead of Raw Reads
 
+To make these the agent's default rather than an occasional choice, see
+[Make it the primary code explorer](#make-it-the-primary-code-explorer).
+
 - `view_code(detail="signatures")` instead of `cat` when you need structure but not bodies.
 - `minimal_edit_context` instead of focused file reads when you are editing one known symbol.
 - `call_graph` instead of reading multiple files to trace one function.
 - `find_usages` instead of concatenating a whole directory to answer one reference question.
 - `code_map` instead of dumping a tree when you only need the project shape.
+- `type_map` instead of grepping for type definitions across the project.
+- `symbol_at_line` instead of opening a file to find which function owns a line (e.g. a stack-trace frame).
 - `review_context` instead of manually assembling diff, impact, tests, and changed-symbol context.
 
 ## Communication Commitments
